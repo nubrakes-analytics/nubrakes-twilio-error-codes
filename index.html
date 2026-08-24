@@ -189,4 +189,332 @@ ids.forEach(function(id){els[id].addEventListener('change',render)});var maxDate
       console.warn('Live GitHub dataset unavailable; using embedded snapshot.', error);
     });
 }());
+</script>
+<style>
+.grid2{display:block;margin-bottom:0}.grid2>.panel{margin-bottom:16px}.grid2 .chart,.grid2 .bars{height:320px}
+#marketLegend,#errorLegend{max-width:72%;justify-content:flex-end}.alert-definition{margin-top:5px;max-width:980px;color:var(--muted);font-size:11px;line-height:1.45}
+@media(max-width:780px){#marketLegend,#errorLegend{max-width:none;justify-content:flex-start}.panel-head{display:block}.panel-head .legend{margin-top:8px}}
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var filters = document.querySelector('.filters');
+  var periodSelect = document.getElementById('period');
+  var alertSelect = document.getElementById('alert');
+  var months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  var urgency = {'CRITICAL': 1, 'WARNING': 2, 'WATCH': 3, 'LOW VOLUME': 4, 'NO BASELINE': 5, 'OK': 6, 'BASELINE': 7};
+  var chartPalette = ['#1769e0', '#e4572e', '#159570', '#d62828', '#0096c7', '#f2a900', '#52677d'];
+  var sourceRows = [];
+  var viewRows = null;
+
+  function makeFilter(id, labelText, choices) {
+    var label = document.createElement('label');
+    label.className = 'filter';
+    label.appendChild(document.createTextNode(labelText + ' '));
+    var select = document.createElement('select');
+    select.id = id;
+    choices.forEach(function (choice) {
+      var option = document.createElement('option');
+      option.value = choice.value;
+      option.textContent = choice.label;
+      select.appendChild(option);
+    });
+    label.appendChild(select);
+    return {label: label, select: select};
+  }
+
+  var dateFilter = makeFilter('dateGrain', 'Date view', [
+    {value: 'day', label: 'Day'},
+    {value: 'week', label: 'Week'},
+    {value: 'month', label: 'Month'}
+  ]);
+  filters.insertBefore(dateFilter.label, periodSelect.closest('label'));
+
+  var rangeFilter = makeFilter('dateRange', 'Date range', [
+    {value: 'ytd', label: 'Year to date'},
+    {value: '7', label: 'Last 7 days'},
+    {value: '30', label: 'Last 30 days'},
+    {value: '90', label: 'Last 90 days'},
+    {value: 'all', label: 'All available dates'}
+  ]);
+  filters.insertBefore(rangeFilter.label, periodSelect.closest('label'));
+
+  var errorFilter = makeFilter('errorCode', 'Error code', [{value: 'all', label: 'All error codes'}]);
+  filters.insertBefore(errorFilter.label, alertSelect.closest('label'));
+
+  function number(value) {
+    var parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  function normalizeDate(value) {
+    var text = String(value || '').trim();
+    var slash = text.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+    if (slash) return String(slash[1]).padStart(2, '0') + '/' + String(slash[2]).padStart(2, '0') + '/' + String(slash[3]).slice(-2);
+    var iso = text.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (iso) return iso[3] + '/' + iso[2] + '/' + iso[1].slice(-2);
+    return text;
+  }
+
+  function dateObject(value) {
+    var normalized = normalizeDate(value);
+    var parts = normalized.split('/').map(Number);
+    return parts.length === 3 ? new Date(2000 + parts[2], parts[1] - 1, parts[0]) : new Date(0);
+  }
+
+  function compactDate(date) {
+    return String(date.getDate()).padStart(2, '0') + '/' + String(date.getMonth() + 1).padStart(2, '0') + '/' + String(date.getFullYear()).slice(-2);
+  }
+
+  function bucketDate(value, grain) {
+    var date = dateObject(value);
+    if (grain === 'week') {
+      var mondayOffset = (date.getDay() + 6) % 7;
+      date.setDate(date.getDate() - mondayOffset);
+    } else if (grain === 'month') {
+      date.setDate(1);
+    }
+    return compactDate(date);
+  }
+
+  function displayDate(value, grain) {
+    var date = dateObject(value);
+    if (!date.getTime()) return value;
+    if (grain === 'month') return months[date.getMonth()] + ' ' + date.getFullYear();
+    var label = String(date.getDate()).padStart(2, '0') + ' ' + months[date.getMonth()] + ' ' + date.getFullYear();
+    return grain === 'week' ? 'Week of ' + label : label;
+  }
+
+  function normalizeRows(rows) {
+    return rows.map(function (row) {
+      var copy = Object.assign({}, row);
+      copy.date = normalizeDate(copy.date);
+      copy.error = copy.error == null || copy.error === '' ? '—' : String(copy.error);
+      copy.errorMessage = copy.errorMessage || 'No delivery error';
+      return copy;
+    });
+  }
+
+  function refreshErrorOptions() {
+    var previous = errorFilter.select.value;
+    var codes = Array.from(new Set(sourceRows.map(function (row) { return row.error; }).filter(function (code) { return code && code !== '—'; }))).sort(function (a, b) {
+      return number(a) - number(b) || String(a).localeCompare(String(b));
+    });
+    errorFilter.select.innerHTML = '';
+    var all = document.createElement('option');
+    all.value = 'all';
+    all.textContent = 'All error codes';
+    errorFilter.select.appendChild(all);
+    codes.forEach(function (code) {
+      var option = document.createElement('option');
+      option.value = code;
+      var example = sourceRows.find(function (row) { return row.error === code; });
+      option.textContent = code + (example && example.errorMessage ? ' — ' + example.errorMessage : '');
+      errorFilter.select.appendChild(option);
+    });
+    if (codes.indexOf(previous) >= 0) errorFilter.select.value = previous;
+  }
+
+  function alertPriority(value) {
+    return urgency[value] || 99;
+  }
+
+  function aggregate(rows, grain) {
+    if (grain === 'day') return rows.slice();
+    var groups = new Map();
+    rows.forEach(function (row) {
+      var date = bucketDate(row.date, grain);
+      var key = [date, row.period, row.market, row.sender, row.messageType, row.error, row.errorMessage, row.carrier].join('\u001f');
+      var item = groups.get(key);
+      if (!item) {
+        item = {
+          date: date, period: row.period, market: row.market, sender: row.sender,
+          messages: 0, leads: 0, failed: 0, affected: 0, rate: 0, affectedRate: 0,
+          baselineMessages: number(row.baselineMessages), baselineFailed: number(row.baselineFailed), baseline: 0,
+          change: 0, excess: 0, error: row.error, errorMessage: row.errorMessage, errorCount: 0,
+          carrier: row.carrier, messageType: row.messageType, delivered: 0,
+          baselineLeads: number(row.baselineLeads), baselineAffected: number(row.baselineAffected),
+          netExcess: 0, alert: row.alert, reason: row.reason, refreshed: row.refreshed,
+          _baselineWeight: 0
+        };
+        groups.set(key, item);
+      }
+      item.messages += number(row.messages);
+      item.leads += number(row.leads);
+      item.failed += number(row.failed);
+      item.affected += number(row.affected);
+      item.excess += number(row.excess);
+      item.errorCount += number(row.errorCount);
+      item.delivered += number(row.delivered);
+      item.netExcess += number(row.netExcess);
+      item._baselineWeight += number(row.baseline) * number(row.messages);
+      item.baselineMessages = Math.max(item.baselineMessages, number(row.baselineMessages));
+      item.baselineFailed = Math.max(item.baselineFailed, number(row.baselineFailed));
+      item.baselineLeads = Math.max(item.baselineLeads, number(row.baselineLeads));
+      item.baselineAffected = Math.max(item.baselineAffected, number(row.baselineAffected));
+      if (alertPriority(row.alert) < alertPriority(item.alert)) {
+        item.alert = row.alert;
+        item.reason = row.reason;
+      }
+    });
+    return Array.from(groups.values()).map(function (item) {
+      item.rate = item.messages ? 100 * item.failed / item.messages : 0;
+      item.affectedRate = item.leads ? 100 * item.affected / item.leads : 0;
+      item.baseline = item.messages ? item._baselineWeight / item.messages : 0;
+      item.change = item.rate - item.baseline;
+      delete item._baselineWeight;
+      return item;
+    });
+  }
+
+  function syncSource() {
+    if (DATA !== viewRows) {
+      sourceRows = normalizeRows(DATA);
+      refreshErrorOptions();
+    }
+  }
+
+  function applyView() {
+    syncSource();
+    periodSelect.value = 'all';
+    var range = rangeFilter.select.value;
+    var latestDate = sourceRows.reduce(function (latest, row) {
+      var current = dateObject(row.date);
+      return !latest || current > latest ? current : latest;
+    }, null);
+    var startDate = null;
+    if (latestDate && range === 'ytd') startDate = new Date(latestDate.getFullYear(), 0, 1);
+    else if (latestDate && range !== 'all') {
+      startDate = new Date(latestDate);
+      startDate.setDate(startDate.getDate() - Math.max(0, number(range) - 1));
+    }
+    var code = errorFilter.select.value;
+    var rows = sourceRows.filter(function (row) {
+      var rowDate = dateObject(row.date);
+      var withinRange = !startDate || (rowDate >= startDate && rowDate <= latestDate);
+      return withinRange && (code === 'all' || row.error === code);
+    });
+    viewRows = aggregate(rows, dateFilter.select.value);
+    DATA = viewRows;
+  }
+
+  function updateTitles() {
+    var grain = dateFilter.select.value;
+    var adjective = grain === 'month' ? 'Monthly' : grain === 'week' ? 'Weekly' : 'Daily';
+    document.getElementById('rateChart').closest('.panel').querySelector('h2').textContent = adjective + ' failure rate';
+    document.getElementById('marketChart').closest('.panel').querySelector('h2').textContent = adjective + ' failure rate contribution by market';
+    document.getElementById('errorChart').closest('.panel').querySelector('h2').textContent = adjective + ' failure rate contribution by leading error';
+    document.getElementById('detailRows').closest('.panel').querySelector('h2').textContent = adjective + ' monitoring detail';
+    document.getElementById('excessBars').closest('.panel').querySelector('.sub').textContent = 'Positive ' + grain + ' variance above the weighted three-month baseline';
+  }
+
+  function addAlertDefinition() {
+    var summary = document.getElementById('alertSummary');
+    var definition = document.getElementById('alertDefinition');
+    if (!definition) {
+      definition = document.createElement('div');
+      definition.id = 'alertDefinition';
+      definition.className = 'alert-definition';
+      summary.insertAdjacentElement('afterend', definition);
+    }
+    var grain = dateFilter.select.value;
+    var period = grain === 'day' ? 'day' : grain;
+    definition.textContent = 'Latest completed ' + period + ' in the selected data. Includes CRITICAL, WARNING and WATCH only. Alert levels and reasons come from the source query and compare observed failure rate with each sender’s weighted three-month pre-13 Aug baseline.' + (grain === 'day' ? '' : ' The roll-up inherits the most urgent source alert in the period.');
+  }
+
+  function recolorChart(svgId, legendId) {
+    var legend = document.getElementById(legendId);
+    var labels = Array.from(legend.querySelectorAll('span')).map(function (span) { return span.textContent.trim(); });
+    var colorByLabel = {};
+    labels.forEach(function (label, index) { colorByLabel[label] = chartPalette[index % chartPalette.length]; });
+    Array.from(legend.querySelectorAll('span')).forEach(function (span, index) {
+      var swatch = span.querySelector('.swatch');
+      if (swatch) swatch.style.background = chartPalette[index % chartPalette.length];
+    });
+    document.getElementById(svgId).querySelectorAll('rect[data-tip]').forEach(function (rect) {
+      var label = (rect.getAttribute('data-tip') || '').split('|')[1];
+      if (colorByLabel[label]) rect.setAttribute('fill', colorByLabel[label]);
+    });
+  }
+
+  function sortMonitoringDetail() {
+    var body = document.getElementById('detailRows');
+    var rows = Array.from(body.querySelectorAll('tr'));
+    rows.sort(function (a, b) {
+      var aAlert = (a.querySelector('.badge') || {}).textContent || '';
+      var bAlert = (b.querySelector('.badge') || {}).textContent || '';
+      var priorityDifference = alertPriority(aAlert) - alertPriority(bAlert);
+      if (priorityDifference) return priorityDifference;
+      var aDate = dateObject(a.cells[0] ? a.cells[0].textContent : '').getTime();
+      var bDate = dateObject(b.cells[0] ? b.cells[0].textContent : '').getTime();
+      if (aDate !== bDate) return bDate - aDate;
+      var aExcess = number((a.cells[10] ? a.cells[10].textContent : '').replace(/,/g, ''));
+      var bExcess = number((b.cells[10] ? b.cells[10].textContent : '').replace(/,/g, ''));
+      return bExcess - aExcess;
+    });
+    rows.forEach(function (row) { body.appendChild(row); });
+  }
+
+  function formatRenderedDates() {
+    var grain = dateFilter.select.value;
+    document.querySelectorAll('#rateChart text,#marketChart text,#errorChart text').forEach(function (node) {
+      if (/^\d{2}\/\d{2}\/\d{2}$/.test(node.textContent.trim())) node.textContent = displayDate(node.textContent.trim(), grain);
+    });
+    document.querySelectorAll('#rateChart [data-tip],#marketChart [data-tip],#errorChart [data-tip]').forEach(function (node) {
+      var tip = node.getAttribute('data-tip') || '';
+      var parts = tip.split('|');
+      if (/^\d{2}\/\d{2}\/\d{2}$/.test(parts[0])) {
+        parts[0] = displayDate(parts[0], grain);
+        node.setAttribute('data-tip', parts.join('|'));
+      }
+    });
+    document.querySelectorAll('#alertRows tr td:first-child,#detailRows tr td:first-child').forEach(function (cell) {
+      if (/^\d{2}\/\d{2}\/\d{2}$/.test(cell.textContent.trim())) cell.textContent = displayDate(cell.textContent.trim(), grain);
+    });
+    var summary = document.getElementById('alertSummary');
+    summary.textContent = summary.textContent.replace(/\d{2}\/\d{2}\/\d{2}/g, function (date) { return displayDate(date, grain); });
+    var freshness = document.getElementById('freshness');
+    freshness.innerHTML = freshness.innerHTML.replace(/\d{2}\/\d{2}\/\d{2}/g, function (date) { return displayDate(date, 'day'); });
+  }
+
+  function polish() {
+    updateTitles();
+    addAlertDefinition();
+    recolorChart('marketChart', 'marketLegend');
+    recolorChart('errorChart', 'errorLegend');
+    sortMonitoringDetail();
+    formatRenderedDates();
+  }
+
+  ['period', 'market', 'sender', 'messageType', 'alert'].forEach(function (id) {
+    var select = document.getElementById(id);
+    select.addEventListener('change', function () {
+      applyView();
+      setTimeout(polish, 0);
+    }, true);
+  });
+
+  function renderNewView() {
+    applyView();
+    periodSelect.dispatchEvent(new Event('change'));
+  }
+
+  dateFilter.select.addEventListener('change', renderNewView);
+  rangeFilter.select.addEventListener('change', renderNewView);
+  errorFilter.select.addEventListener('change', renderNewView);
+
+  applyView();
+  periodSelect.dispatchEvent(new Event('change'));
+}());
+</script>
+<script>
+(function () {
+  var period = document.getElementById('period');
+  if (!period) return;
+  period.value = 'all';
+  var periodFilter = period.closest('label');
+  if (periodFilter) periodFilter.hidden = true;
+  period.dispatchEvent(new Event('change'));
+}());
 </script></body></html>
